@@ -117,6 +117,7 @@ class FantacalcioAstaChiamataEnv(gym.Env):
         self.agente_offerta = -1  # Chi ha fatto l'offerta corrente
         self.turno_globale = 0
         self.giri_senza_rilanci = 0  # Per tracciare quando tutti hanno passato
+        self.ultima_chiamata_agente = -1 # Chi ha fatto l'ultima chiamata 
         
         # Statistiche per i reward
         self.valore_totale_rose = [0.0] * self.n_agenti
