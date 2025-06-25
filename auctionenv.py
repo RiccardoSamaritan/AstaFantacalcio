@@ -4,9 +4,11 @@ from gym import spaces
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
 
-class FantacalcioAstaEnv(gym.Env):
+class FantacalcioAstaChiamataEnv(gym.Env):
     """
-    Ambiente che simula un'asta del fantacalcio.
+    Ambiente che simula un'asta del fantacalcio a chiamata.
+    In questo tipo di asta, ogni agente nel suo turno chiama un giocatore
+    e tutti gli altri possono rilanciare.
     """
     
     def __init__(self, 
@@ -16,9 +18,10 @@ class FantacalcioAstaEnv(gym.Env):
                  n_portieri: int = 3,
                  n_difensori: int = 8, 
                  n_centrocampisti: int = 8,
-                 n_attaccanti: int = 6):
+                 n_attaccanti: int = 6,
+                 rialzo_minimo: int = 1):
         """
-        Inizializza l'ambiente dell'asta del fantacalcio.
+        Inizializza l'ambiente dell'asta del fantacalcio a chiamata.
         
         Args:
             giocatori_df: DataFrame contenente i dati dei giocatori 
@@ -29,6 +32,7 @@ class FantacalcioAstaEnv(gym.Env):
             n_difensori: Numero di difensori da acquistare
             n_centrocampisti: Numero di centrocampisti da acquistare
             n_attaccanti: Numero di attaccanti da acquistare
+            rialzo_minimo: Rialzo minimo per le offerte (default 1)
         """
         super().__init__()
         
@@ -39,59 +43,58 @@ class FantacalcioAstaEnv(gym.Env):
         self.n_difensori = n_difensori
         self.n_centrocampisti = n_centrocampisti
         self.n_attaccanti = n_attaccanti
+        self.rialzo_minimo = rialzo_minimo
         
         # Dataframe con tutti i giocatori
-        self.giocatori_df = giocatori_df
-        
-        # Spazio delle azioni: [offerta] dove offerta è compresa tra 0 (passa) e il budget rimanente
-        self.action_space = spaces.Box(low=0, high=budget_iniziale, shape=(1,), dtype=np.int32)
-        
-        # Calcola il numero massimo di giocatori per costruire lo spazio di osservazione
+        self.giocatori_df = giocatori_df.reset_index(drop=True)
         self.max_giocatori = len(giocatori_df)
         
-        # Spazio delle osservazioni:
-        # - budget_rimanente (1 valore)
-        # - giocatore corrente (1 valore per indice, 1 per ruolo, 1 per valore stimato)
-        # - giocatori in rosa (4 valori per il conteggio dei ruoli)
-        # - offerta corrente e chi l'ha fatta (2 valori)
-        # - budgets degli avversari (n_agenti-1 valori)
-        # - rose degli avversari (4*(n_agenti-1) valori per i conteggi dei ruoli)
-        obs_shape = 1 + 3 + 4 + 2 + (n_agenti-1) + 4*(n_agenti-1)
-        self.observation_space = spaces.Box(low=0, high=budget_iniziale, shape=(obs_shape,), dtype=np.float32)
+        # Spazio delle azioni: 
+        # - Se è il turno di chiamare: [giocatore_idx] (0 a num_giocatori-1)
+        # - Se è il turno di rilancio: [offerta] (0 = passa, >0 = rilancia)
+        self.action_space = spaces.Box(low=0, high=max(budget_iniziale, self.max_giocatori), 
+                                     shape=(1,), dtype=np.int32)
         
-        # Variabili di stato dell'ambiente
-        self.budgets = None  # Budget rimanente per ogni agente
-        self.roster = None   # Rosa di ogni agente (dict di liste di indici giocatori)
-        self.giocatori_disponibili = None  # Indici dei giocatori ancora disponibili
-        self.giocatore_corrente = None  # Indice del giocatore attualmente in asta
-        self.offerta_corrente = None  # Valore dell'offerta corrente
-        self.agente_offerta = None  # Chi ha fatto l'offerta attuale
-        self.turno_agente = None  # Di chi è il turno di rilanciare
-        self.turno = None  # Turno globale della partita
-        self.posizioni_per_ruolo = {"P": 0, "D": 0, "C": 0, "A": 0}  # Conteggio posizioni per ruolo
-        self.ruoli_dict = {"P": n_portieri, "D": n_difensori, "C": n_centrocampisti, "A": n_attaccanti}
+        # Spazio delle osservazioni:
+        # - budget dell'agente corrente (1)
+        # - fase dell'asta: 0=chiamata, 1=rilancio (1)
+        # - giocatore attualmente in asta (-1 se nessuno) (1)
+        # - offerta corrente (1)
+        # - chi ha fatto l'offerta corrente (-1 se nessuno) (1)
+        # - giocatori in rosa dell'agente corrente per ruolo (4)
+        # - giocatori disponibili per ruolo (4) 
+        # - budgets degli altri agenti (n_agenti-1)
+        # - conteggio giocatori per ruolo degli altri agenti (4*(n_agenti-1))
+        obs_shape = 1 + 1 + 1 + 1 + 1 + 4 + 4 + (n_agenti-1) + 4*(n_agenti-1)
+        self.observation_space = spaces.Box(low=-1, high=budget_iniziale, 
+                                          shape=(obs_shape,), dtype=np.float32)
+        
+        # Dizionario dei ruoli
+        self.ruoli_dict = {"P": n_portieri, "D": n_difensori, 
+                          "C": n_centrocampisti, "A": n_attaccanti}
+        
+        # Stati dell'ambiente
+        self.reset()
         
     def reset(self):
         """Reimposta l'ambiente all'inizio di una nuova asta."""
-        # Resetta budget e rose
+        # Reset budget e rose
         self.budgets = [self.budget_iniziale] * self.n_agenti
         self.roster = {i: [] for i in range(self.n_agenti)}
         self.roster_ruoli = {i: {"P": [], "D": [], "C": [], "A": []} for i in range(self.n_agenti)}
         
-        # Resetta i giocatori disponibili (tutti all'inizio)
-        self.giocatori_disponibili = list(self.giocatori_df.index)
-        np.random.shuffle(self.giocatori_disponibili)
+        # Giocatori disponibili (tutti all'inizio)
+        self.giocatori_disponibili = set(range(len(self.giocatori_df)))
         
-        # Inizia con il primo giocatore
-        self._next_giocatore()
-        
-        # Azzera offerta corrente
+        # Stati dell'asta
+        self.fase = "chiamata"  # "chiamata" o "rilancio"
+        self.agente_di_turno = 0  # Chi deve chiamare o chi ha chiamato
+        self.agente_rilancio = 0  # Chi deve decidere se rilanciare
+        self.giocatore_in_asta = -1  # Indice del giocatore attualmente in asta
         self.offerta_corrente = 0
-        self.agente_offerta = None
-        
-        # Sceglie casualmente chi inizia
-        self.turno_agente = np.random.randint(0, self.n_agenti)
-        self.turno = 0
+        self.agente_offerta = -1  # Chi ha fatto l'offerta corrente
+        self.turno_globale = 0
+        self.giri_senza_rilanci = 0  # Per tracciare quando tutti hanno passato
         
         return self._get_observation()
         
@@ -100,7 +103,7 @@ class FantacalcioAstaEnv(gym.Env):
         Esegue un'azione nell'ambiente.
         
         Args:
-            action: Offerta fatta dall'agente (0 significa passa)
+            action: Array con l'azione (chiamata giocatore o offerta)
             
         Returns:
             observation: Stato aggiornato dell'ambiente
@@ -108,168 +111,207 @@ class FantacalcioAstaEnv(gym.Env):
             done: Se l'episodio è terminato
             info: Informazioni addizionali
         """
-        # Estrai l'offerta dall'azione
-        offerta = int(action[0])
-        agente_corrente = self.turno_agente
-        
-        # Controllo se l'azione è valida
-        valid_action = self._is_valid_action(offerta, agente_corrente)
-        
+        azione = int(action[0])
         reward = 0
         done = False
-        info = {"valid_action": valid_action}
+        info = {"valid_action": True, "fase": self.fase}
         
-        if valid_action:
-            if offerta > 0:  # L'agente ha fatto un'offerta
-                self.offerta_corrente = offerta
-                self.agente_offerta = agente_corrente
+        if self.fase == "chiamata":
+            # L'agente deve chiamare un giocatore
+            if self._is_valid_chiamata(azione):
+                self._esegui_chiamata(azione)
+                reward = 0  # Neutrale per la chiamata
+            else:
+                reward = -10  # Penalità per chiamata non valida
+                info["valid_action"] = False
                 
-                # Passa al prossimo agente
-                self._next_turno()
-                reward = 0  # Neutrale per ora, solo offerta
-            else:  # L'agente passa
-                # Se tutti hanno passato tranne uno, assegna il giocatore
-                if self.agente_offerta is not None:
-                    # Controlla se questo è l'ultimo agente a passare
-                    passi_consecutivi = 0
-                    for i in range(self.n_agenti):
-                        next_agent = (agente_corrente + i) % self.n_agenti
-                        if next_agent != self.agente_offerta:
-                            passi_consecutivi += 1
-                        else:
-                            break
-                            
-                    if passi_consecutivi == self.n_agenti - 1:
-                        # Tutti tranne l'offerente hanno passato
-                        self._assegna_giocatore(self.agente_offerta, self.offerta_corrente)
-                        
-                        # Se non ci sono più giocatori, termina
-                        if len(self.giocatori_disponibili) == 0:
-                            done = True
-                        else:
-                            # Passa al prossimo giocatore da mettere in asta
-                            self._next_giocatore()
-                            
-                            # Resetta offerta
-                            self.offerta_corrente = 0
-                            self.agente_offerta = None
-                            
-                            # L'agente che ha preso l'ultimo giocatore inizia il turno
-                            self.turno_agente = self.agente_offerta
-                            
-                    else:
-                        # Passa al prossimo agente
-                        self._next_turno()
-                else:
-                    # Nessuno ha offerto, si passa al prossimo giocatore
-                    self._next_giocatore()
-                    
-        else:
-            # Azione non valida, penalità
-            reward = -10
-            
-        # Incrementa turno globale
-        self.turno += 1
+        elif self.fase == "rilancio":
+            # L'agente deve decidere se rilanciare o passare
+            if self._is_valid_rilancio(azione):
+                if azione == 0:  # Passa
+                    reward = self._esegui_passa()
+                else:  # Rilancia
+                    reward = self._esegui_rilancio(azione)
+            else:
+                reward = -10  # Penalità per rilancio non valido
+                info["valid_action"] = False
         
-        # Verifica se l'asta è terminata (tutti i ruoli soddisfatti o nessun budget)
-        remaining_budgets = sum(1 for b in self.budgets if b > 0)
-        if remaining_budgets == 0:
-            done = True
-            
-        # Verifica se un agente ha completato tutti i ruoli
-        for agente in range(self.n_agenti):
-            all_fulfilled = True
-            for ruolo, n_required in self.ruoli_dict.items():
-                if len(self.roster_ruoli[agente][ruolo]) < n_required:
-                    all_fulfilled = False
-                    break
-            if all_fulfilled:
-                info["roster_completo_agente"] = agente
-                # Non terminiamo qui perché vogliamo che tutti completino la rosa
-
-        # Ritorna stato, reward, done e info
+        # Controlla se l'asta è terminata
+        done = self._is_asta_terminata()
+        
+        # Aggiorna turno globale
+        self.turno_globale += 1
+        
         return self._get_observation(), reward, done, info
     
-    def _is_valid_action(self, offerta, agente):
-        """Controlla se l'azione è valida."""
-        # Se offerta è 0, significa che l'agente passa
-        if offerta == 0:
-            return True
-            
-        # L'offerta deve essere maggiore dell'offerta corrente
-        if offerta <= self.offerta_corrente:
+    def _is_valid_chiamata(self, giocatore_idx):
+        """Controlla se la chiamata del giocatore è valida."""
+        # Il giocatore deve esistere ed essere disponibile
+        if giocatore_idx < 0 or giocatore_idx >= len(self.giocatori_df):
+            return False
+        if giocatore_idx not in self.giocatori_disponibili:
             return False
             
-        # L'agente deve avere abbastanza budget
-        if offerta > self.budgets[agente]:
+        # L'agente deve poter ancora comprare quel ruolo
+        ruolo = self.giocatori_df.loc[giocatore_idx, "ruolo"]
+        if len(self.roster_ruoli[self.agente_di_turno][ruolo]) >= self.ruoli_dict[ruolo]:
             return False
             
-        # L'agente deve poter comprare ancora quel ruolo
-        ruolo = self.giocatori_df.loc[self.giocatore_corrente, "ruolo"]
-        if len(self.roster_ruoli[agente][ruolo]) >= self.ruoli_dict[ruolo]:
+        # L'agente deve avere almeno 1 credito
+        if self.budgets[self.agente_di_turno] < 1:
             return False
             
         return True
     
-    def _next_turno(self):
-        """Passa al prossimo agente."""
-        self.turno_agente = (self.turno_agente + 1) % self.n_agenti
+    def _is_valid_rilancio(self, offerta):
+        """Controlla se il rilancio è valido."""
+        if offerta == 0:  # Passa sempre valido
+            return True
+            
+        # L'offerta deve essere almeno rialzo_minimo sopra l'offerta corrente
+        if offerta < self.offerta_corrente + self.rialzo_minimo:
+            return False
+            
+        # L'agente deve avere abbastanza budget
+        if offerta > self.budgets[self.agente_rilancio]:
+            return False
+            
+        # L'agente deve poter ancora comprare quel ruolo
+        ruolo = self.giocatori_df.loc[self.giocatore_in_asta, "ruolo"]
+        if len(self.roster_ruoli[self.agente_rilancio][ruolo]) >= self.ruoli_dict[ruolo]:
+            return False
+            
+        return True
     
-    def _next_giocatore(self):
-        """Seleziona il prossimo giocatore da mettere all'asta."""
-        if len(self.giocatori_disponibili) > 0:
-            self.giocatore_corrente = self.giocatori_disponibili.pop(0)
-        else:
-            self.giocatore_corrente = None
+    def _esegui_chiamata(self, giocatore_idx):
+        """Esegue la chiamata di un giocatore."""
+        self.giocatore_in_asta = giocatore_idx
+        self.offerta_corrente = 1  # Offerta base di 1 credito
+        self.agente_offerta = self.agente_di_turno
+        
+        # Passa alla fase di rilancio
+        self.fase = "rilancio"
+        self.agente_rilancio = (self.agente_di_turno + 1) % self.n_agenti
+        self.giri_senza_rilanci = 0
     
-    def _assegna_giocatore(self, agente, offerta):
-        """Assegna un giocatore a un agente."""
+    def _esegui_passa(self):
+        """Esegue il passaggio durante la fase di rilancio."""
+        # Passa al prossimo agente
+        self.agente_rilancio = (self.agente_rilancio + 1) % self.n_agenti
+        
+        # Se siamo tornati all'agente che ha l'offerta corrente, tutti hanno passato
+        if self.agente_rilancio == self.agente_offerta:
+            self._assegna_giocatore()
+            return 0
+        
+        return 0  # Reward neutrale per il passaggio
+    
+    def _esegui_rilancio(self, offerta):
+        """Esegue un rilancio."""
+        self.offerta_corrente = offerta
+        self.agente_offerta = self.agente_rilancio
+        
+        # Passa al prossimo agente
+        self.agente_rilancio = (self.agente_rilancio + 1) % self.n_agenti
+        
+        # Se siamo tornati all'agente che ha rilanciato, tutti hanno passato
+        if self.agente_rilancio == self.agente_offerta:
+            self._assegna_giocatore()
+            
+        return 0  # Reward neutrale per il rilancio
+    
+    def _assegna_giocatore(self):
+        """Assegna il giocatore all'agente che ha fatto l'offerta più alta."""
         # Aggiorna budget
-        self.budgets[agente] -= offerta
+        self.budgets[self.agente_offerta] -= self.offerta_corrente
         
         # Aggiungi giocatore alla rosa
-        self.roster[agente].append(self.giocatore_corrente)
+        self.roster[self.agente_offerta].append(self.giocatore_in_asta)
         
         # Aggiorna il conteggio per ruolo
-        ruolo = self.giocatori_df.loc[self.giocatore_corrente, "ruolo"]
-        self.roster_ruoli[agente][ruolo].append(self.giocatore_corrente)
+        ruolo = self.giocatori_df.loc[self.giocatore_in_asta, "ruolo"]
+        self.roster_ruoli[self.agente_offerta][ruolo].append(self.giocatore_in_asta)
         
+        # Rimuovi il giocatore dai disponibili
+        self.giocatori_disponibili.remove(self.giocatore_in_asta)
+        
+        # Torna alla fase di chiamata con il prossimo agente
+        self.fase = "chiamata"
+        self.agente_di_turno = (self.agente_di_turno + 1) % self.n_agenti
+        self.giocatore_in_asta = -1
+        self.offerta_corrente = 0
+        self.agente_offerta = -1
+    
+    def _is_asta_terminata(self):
+        """Controlla se l'asta è terminata."""
+        # Nessun giocatore disponibile
+        if len(self.giocatori_disponibili) == 0:
+            return True
+            
+        # Nessun agente ha budget sufficiente
+        if all(budget < 1 for budget in self.budgets):
+            return True
+            
+        # Tutti gli agenti hanno completato le rose richieste
+        for agente in range(self.n_agenti):
+            for ruolo, n_required in self.ruoli_dict.items():
+                if len(self.roster_ruoli[agente][ruolo]) < n_required:
+                    # Controlla se ci sono ancora giocatori di quel ruolo disponibili
+                    # e se l'agente ha budget
+                    giocatori_ruolo = [i for i in self.giocatori_disponibili 
+                                     if self.giocatori_df.loc[i, "ruolo"] == ruolo]
+                    if giocatori_ruolo and self.budgets[agente] >= 1:
+                        return False
+        
+        return True
+    
     def _get_observation(self):
         """Ritorna l'osservazione corrente dell'ambiente."""
-        # Inizializza array di osservazione con zeri
         obs = np.zeros(self.observation_space.shape[0], dtype=np.float32)
+        idx = 0
         
-        # Budget rimasto dell'agente corrente
-        obs[0] = self.budgets[self.turno_agente]
+        # Budget dell'agente corrente
+        agente_corrente = self.agente_di_turno if self.fase == "chiamata" else self.agente_rilancio
+        obs[idx] = self.budgets[agente_corrente]
+        idx += 1
         
-        # Informazioni sul giocatore corrente
-        if self.giocatore_corrente is not None:
-            giocatore = self.giocatori_df.loc[self.giocatore_corrente]
-            obs[1] = self.giocatore_corrente  # Indice
-            # Codifica one-hot del ruolo (P=0, D=1, C=2, A=3)
-            ruolo_idx = {"P": 0, "D": 1, "C": 2, "A": 3}.get(giocatore["ruolo"], 0)
-            obs[2] = ruolo_idx
-            obs[3] = giocatore["valore"]  # Valore stimato
+        # Fase dell'asta (0=chiamata, 1=rilancio)
+        obs[idx] = 0 if self.fase == "chiamata" else 1
+        idx += 1
         
-        # Conteggio giocatori per ruolo nell'agente corrente
-        for i, ruolo in enumerate(["P", "D", "C", "A"]):
-            obs[4 + i] = len(self.roster_ruoli[self.turno_agente][ruolo])
+        # Giocatore in asta (-1 se nessuno)
+        obs[idx] = self.giocatore_in_asta
+        idx += 1
         
-        # Offerta corrente e chi l'ha fatta
-        obs[8] = self.offerta_corrente
-        if self.agente_offerta is not None:
-            obs[9] = self.agente_offerta
+        # Offerta corrente
+        obs[idx] = self.offerta_corrente
+        idx += 1
         
-        # Budget degli avversari
-        idx = 10
+        # Chi ha fatto l'offerta corrente
+        obs[idx] = self.agente_offerta
+        idx += 1
+        
+        # Giocatori in rosa dell'agente corrente per ruolo
+        for ruolo in ["P", "D", "C", "A"]:
+            obs[idx] = len(self.roster_ruoli[agente_corrente][ruolo])
+            idx += 1
+        
+        # Giocatori disponibili per ruolo
+        for ruolo in ["P", "D", "C", "A"]:
+            count = sum(1 for i in self.giocatori_disponibili 
+                       if self.giocatori_df.loc[i, "ruolo"] == ruolo)
+            obs[idx] = count
+            idx += 1
+        
+        # Budget degli altri agenti
         for agente in range(self.n_agenti):
-            if agente != self.turno_agente:
+            if agente != agente_corrente:
                 obs[idx] = self.budgets[agente]
                 idx += 1
         
-        # Conteggio ruoli degli avversari
+        # Conteggio giocatori per ruolo degli altri agenti
         for agente in range(self.n_agenti):
-            if agente != self.turno_agente:
+            if agente != agente_corrente:
                 for ruolo in ["P", "D", "C", "A"]:
                     obs[idx] = len(self.roster_ruoli[agente][ruolo])
                     idx += 1
@@ -281,92 +323,57 @@ class FantacalcioAstaEnv(gym.Env):
         if mode != "human":
             return
             
-        print(f"\n=== TURNO {self.turno} ===")
-        print(f"Agente di turno: {self.turno_agente}")
+        print(f"\n=== TURNO {self.turno_globale} - FASE: {self.fase.upper()} ===")
         
-        if self.giocatore_corrente is not None:
-            giocatore = self.giocatori_df.loc[self.giocatore_corrente]
-            print(f"Giocatore all'asta: {giocatore['nome']} ({giocatore['ruolo']}) - Valore: {giocatore['valore']}")
-        
-        print(f"Offerta corrente: {self.offerta_corrente} crediti", end="")
-        if self.agente_offerta is not None:
-            print(f" (Agente {self.agente_offerta})")
+        if self.fase == "chiamata":
+            print(f"Agente {self.agente_di_turno} deve chiamare un giocatore")
         else:
-            print()
-            
+            print(f"Agente {self.agente_rilancio} deve decidere se rilanciare")
+            if self.giocatore_in_asta >= 0:
+                giocatore = self.giocatori_df.loc[self.giocatore_in_asta]
+                print(f"Giocatore in asta: {giocatore['nome']} ({giocatore['ruolo']}) - Valore stimato: {giocatore['valore']}")
+                print(f"Offerta corrente: {self.offerta_corrente} crediti (Agente {self.agente_offerta})")
+        
+        print(f"\nGiocatori disponibili: {len(self.giocatori_disponibili)}")
+        
         print("\nStato degli agenti:")
         for i in range(self.n_agenti):
-            print(f"Agente {i}: Budget {self.budgets[i]} crediti")
+            marker = ">>> " if (i == self.agente_di_turno and self.fase == "chiamata") or \
+                              (i == self.agente_rilancio and self.fase == "rilancio") else "    "
+            print(f"{marker}Agente {i}: Budget {self.budgets[i]} crediti")
             for ruolo in ["P", "D", "C", "A"]:
-                print(f"  {ruolo}: {len(self.roster_ruoli[i][ruolo])}/{self.ruoli_dict[ruolo]}", end=" ")
+                count = len(self.roster_ruoli[i][ruolo])
+                required = self.ruoli_dict[ruolo]
+                print(f"      {ruolo}: {count}/{required}", end=" ")
                 if self.roster_ruoli[i][ruolo]:
                     nomi = [self.giocatori_df.loc[idx, 'nome'] for idx in self.roster_ruoli[i][ruolo]]
                     print(f"({', '.join(nomi)})")
                 else:
                     print()
-            print()
-            
-        print(f"Giocatori rimanenti: {len(self.giocatori_disponibili)}")
-        print("=" * 50)
+        
+        print("=" * 60)
 
-# Esempio di utilizzo
-if __name__ == "__main__":
-    # Crea un DataFrame di esempio con alcuni giocatori
-    giocatori_data = {
-        'nome': [
-            # Portieri
-            'Maignan', 'Sommer', 'Di Gregorio', 'Szczesny', 'Provedel', 'Carnesecchi',
-            # Difensori
-            'Bastoni', 'Bremer', 'Di Lorenzo', 'Dimarco', 'Pavard', 'Calafiori', 'Buongiorno', 'Theo Hernandez',
-            # Centrocampisti
-            'Barella', 'Calhanoglu', 'Koopmeiners', 'Pulisic', 'Zaccagni', 'Zielinski', 'Pellegrini', 'Chiesa',
-            # Attaccanti
-            'Lautaro', 'Vlahovic', 'Osimhen', 'Kvaratskhelia', 'Dybala', 'Lukaku', 'Leao', 'Thuram'
-        ],
-        'ruolo': [
-            # Portieri
-            'P', 'P', 'P', 'P', 'P', 'P',
-            # Difensori
-            'D', 'D', 'D', 'D', 'D', 'D', 'D', 'D',
-            # Centrocampisti
-            'C', 'C', 'C', 'C', 'C', 'C', 'C', 'C',
-            # Attaccanti
-            'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A'
-        ],
-        'valore': [
-            # Portieri
-            30, 20, 18, 15, 15, 13,
-            # Difensori
-            25, 22, 20, 30, 20, 18, 22, 32,
-            # Centrocampisti
-            35, 30, 40, 28, 25, 20, 22, 30,
-            # Attaccanti
-            50, 45, 35, 40, 38, 30, 35, 28,
-        ]
-    }
-    
-    giocatori_df = pd.DataFrame(giocatori_data)
-    
-    # Crea l'ambiente
-    env = FantacalcioAstaEnv(giocatori_df, n_agenti=4, budget_iniziale=300)
-    
-    # Reset dell'ambiente
-    observation = env.reset()
-    
-    # Esempio di qualche step di asta
-    for _ in range(5):
-        env.render()
-        
-        # Genera un'azione casuale per il test
-        action = np.array([np.random.randint(0, 20)])
-        if np.random.random() < 0.3:  # 30% probabilità di passare
-            action[0] = 0
+    def get_valid_actions(self):
+        """Ritorna le azioni valide per l'agente corrente."""
+        if self.fase == "chiamata":
+            # Ritorna tutti i giocatori che possono essere chiamati
+            valid_players = []
+            for giocatore_idx in self.giocatori_disponibili:
+                if self._is_valid_chiamata(giocatore_idx):
+                    valid_players.append(giocatore_idx)
+            return valid_players
+        else:
+            # Fase di rilancio: può sempre passare (0) o fare offerte valide
+            valid_offers = [0]  # Può sempre passare
             
-        observation, reward, done, info = env.step(action)
-        print(f"Action: {action}, Reward: {reward}, Done: {done}")
-        print(f"Info: {info}")
-        
-        if done:
-            break
-    
-    env.render()
+            # Aggiunge tutte le offerte possibili dal minimo al budget
+            min_offer = self.offerta_corrente + self.rialzo_minimo
+            max_offer = self.budgets[self.agente_rilancio]
+            
+            if min_offer <= max_offer:
+                # Controlla se può comprare il ruolo
+                ruolo = self.giocatori_df.loc[self.giocatore_in_asta, "ruolo"]
+                if len(self.roster_ruoli[self.agente_rilancio][ruolo]) < self.ruoli_dict[ruolo]:
+                    valid_offers.extend(range(min_offer, max_offer + 1))
+            
+            return valid_offers
